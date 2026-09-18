@@ -60,6 +60,7 @@ jobs:
       # 未签名包只够自己测（要手动去掉隔离属性），不能发给用户。
       - name: Check signing secrets
         id: signing
+        if: runner.os == 'macOS'
         shell: bash
         run: |
           if [ -n "${{ secrets.APPLE_CERTIFICATE }}" ]; then
