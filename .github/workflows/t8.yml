@@ -1,0 +1,63 @@
+name: T8
+
+# 打包在 GitHub 的机器上跑，因为 macOS 包只能由 macOS 出：
+# 编译要 Apple 的 SDK，打 DMG 要 hdiutil，签名要 codesign，都是 Mac 独有的。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 一个平台挂了，另一个照常出包，便于定位问题
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            label: macos
+          - os: windows-2022
+            label: windows
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Intel 和 Apple Silicon 打进同一个包，用户不用挑
+      - name: Add macOS targets
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      # 测试锁着几次真实事故（env_key、废弃的 SMALL_FAST_MODEL 等），
+      # 不能靠人记得跑，放在出包前强制执行
+      - name: Test
+        working-directory: src-tauri
+        run: cargo test
+
+      # —————— 签名：有证书就签，没有就出未签名包 ——————
+      # 未签名包只够自己测（要手动去掉隔离属性），不能发给用户。
+      - name: Check signing secrets
+        id: signing
+        shell: bash
+        run: |
+          if [ -n "${{ secrets.APPLE_CERTIFICATE }}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::未配置 APPLE_CERTIFICATE，将产出未签名的 Mac 包，用户下载后会被 Gatekeeper 拦下"
+          fi

@@ -1,0 +1,164 @@
+name: T15
+
+# 打包在 GitHub 的机器上跑，因为 macOS 包只能由 macOS 出：
+# 编译要 Apple 的 SDK，打 DMG 要 hdiutil，签名要 codesign，都是 Mac 独有的。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 一个平台挂了，另一个照常出包，便于定位问题
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            label: macos
+          - os: windows-2022
+            label: windows
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Intel 和 Apple Silicon 打进同一个包，用户不用挑
+      - name: Add macOS targets
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      # 测试锁着几次真实事故（env_key、废弃的 SMALL_FAST_MODEL 等），
+      # 不能靠人记得跑，放在出包前强制执行
+      - name: Test
+        working-directory: src-tauri
+        run: cargo test
+
+      # —————— 签名：有证书就签，没有就出未签名包 ——————
+      # 未签名包只够自己测（要手动去掉隔离属性），不能发给用户。
+      - name: Check signing secrets
+        id: signing
+        shell: bash
+        run: |
+          if [ -n "${{ secrets.APPLE_CERTIFICATE }}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::未配置 APPLE_CERTIFICATE，将产出未签名的 Mac 包，用户下载后会被 Gatekeeper 拦下"
+          fi
+
+      - name: Import Apple certificate
+        if: runner.os == 'macOS' && steps.signing.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          printf '%s' "${{ secrets.APPLE_CERTIFICATE }}" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "${{ secrets.KEYCHAIN_PASSWORD }}" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          security unlock-keychain -p "${{ secrets.KEYCHAIN_PASSWORD }}" "$KEYCHAIN"
+          security import "$CERT_PATH" -k "$KEYCHAIN" \
+            -P "${{ secrets.APPLE_CERTIFICATE_PASSWORD }}" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "${{ secrets.KEYCHAIN_PASSWORD }}" "$KEYCHAIN"
+
+          # 证书里可能有多个身份，必须挑 Developer ID Application 那个 ——
+          # 用 Apple Development 签出来的包发给用户一样打不开
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | grep "Developer ID Application" | grep -oE '"[^"]+"' | head -1 | tr -d '"')
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::证书里没有 Developer ID Application 身份"
+            security find-identity -v -p codesigning "$KEYCHAIN"
+            exit 1
+          fi
+          echo "APPLE_SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          rm -f "$CERT_PATH"
+
+      # 公证服务经常超时或排队，单次失败不代表包有问题，所以重试
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        timeout-minutes: 60
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            echo "=== 第 ${attempt}/3 次 ==="
+            if npm run tauri build -- --target universal-apple-darwin; then
+              exit 0
+            fi
+            [ "$attempt" -eq 3 ] && exit 1
+            sleep $((attempt * 60))
+          done
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: npm run tauri build
+
+      - name: Collect macOS assets
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p release-assets
+          BUNDLE=src-tauri/target/universal-apple-darwin/release/bundle
+          APP=$(find "$BUNDLE/macos" -maxdepth 1 -name "*.app" -type d | head -1)
+          [ -n "$APP" ] || { echo "::error::没找到 .app"; exit 1; }
+
+          # 把公证票据钉进 .app，这样用户断网也能通过校验
+          if [ "${{ steps.signing.outputs.enabled }}" = "true" ]; then
+            xcrun stapler staple "$APP"
+          fi
+
+          ditto -c -k --sequesterRsrc --keepParent "$APP" \
+            "release-assets/星域互联API配置器_macOS_${GITHUB_REF_NAME}.zip"
+
+          DMG=$(find "$BUNDLE/dmg" -maxdepth 1 -name "*.dmg" -type f | head -1 || true)
+          [ -n "$DMG" ] && cp "$DMG" "release-assets/星域互联API配置器_macOS_${GITHUB_REF_NAME}.dmg"
+
+      - name: Collect Windows assets
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p release-assets
+          B=src-tauri/target/release
+          cp "$B/bundle/nsis/"*-setup.exe "release-assets/星域互联API配置器_安装版_${GITHUB_REF_NAME}.exe"
+          cp "$B/bundle/msi/"*.msi        "release-assets/星域互联API配置器_MSI版_${GITHUB_REF_NAME}.msi"
+          cp "$B/starnexus-api.exe"       "release-assets/星域互联API配置器_免安装_${GITHUB_REF_NAME}.exe"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: release-assets/*
+
+      # 只有打 tag 才发布，手动触发时只留 artifact
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          draft: true
