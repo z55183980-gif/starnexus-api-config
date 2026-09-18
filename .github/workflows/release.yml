@@ -101,9 +101,13 @@ jobs:
           echo "APPLE_SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
           rm -f "$CERT_PATH"
 
-      # 公证服务经常超时或排队，单次失败不代表包有问题，所以重试
-      - name: Build (macOS)
-        if: runner.os == 'macOS'
+      # 签名和不签名必须分成两个步骤。
+      # 关键在于：没有证书时绝不能让 APPLE_SIGNING_IDENTITY 存在 ——
+      # 哪怕值是空串，Tauri 也会当成"要签名"，然后拿空身份去钥匙串里找，
+      # 报 "The specified item could not be found in the keychain"。
+      # 变量不存在时它才会跳过签名。
+      - name: Build (macOS, 已签名)
+        if: runner.os == 'macOS' && steps.signing.outputs.enabled == 'true'
         shell: bash
         timeout-minutes: 60
         env:
@@ -113,6 +117,8 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -uo pipefail
+          # 只有这条路径需要重试 —— Apple 的公证服务经常排队超时，
+          # 单次失败不代表包有问题。不签名的那条路径失败都是确定性的，重试纯浪费。
           for attempt in 1 2 3; do
             echo "=== 第 ${attempt}/3 次 ==="
             if npm run tauri build -- --target universal-apple-darwin; then
@@ -121,6 +127,12 @@ jobs:
             [ "$attempt" -eq 3 ] && exit 1
             sleep $((attempt * 60))
           done
+
+      - name: Build (macOS, 未签名)
+        if: runner.os == 'macOS' && steps.signing.outputs.enabled != 'true'
+        shell: bash
+        timeout-minutes: 60
+        run: npm run tauri build -- --target universal-apple-darwin
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
